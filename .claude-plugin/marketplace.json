@@ -1,0 +1,14 @@
+{
+  "name": "desk-meter",
+  "owner": {
+    "name": "Jacob"
+  },
+  "description": "Desk Meter: show your Claude usage limits on an e-ink desk display.",
+  "plugins": [
+    {
+      "name": "desk-meter",
+      "source": "./plugin",
+      "description": "Shows your Claude usage limits on an e-ink desk display."
+    }
+  ]
+}

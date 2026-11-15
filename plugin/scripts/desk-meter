@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# Desk Meter helper: manages the status line and your list of e-ink meters.
+#
+#   desk-meter doctor               check dependencies and current setup
+#   desk-meter install-statusline   point Claude Code's status line at Desk Meter
+#   desk-meter remove-statusline    undo that, restoring any previous status line
+#   desk-meter discover             find meters on the local network
+#   desk-meter add HOST TOKEN       add (or update) a meter
+#   desk-meter remove HOST          forget a meter
+#   desk-meter list                 show your meters and whether they're reachable
+#   desk-meter test                 send sample data to every meter
+#   desk-meter sync                 refresh the installed status line script (used by a hook)
+#
+# Config lives in ~/.config/desk-meter (override with DESK_METER_HOME):
+#   devices         one "host token" per line (chmod 600)
+#   chain_command   your previous status line command, still shown
+#   statusline.sh   the status line script Claude Code runs
+
+set -u
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${DESK_METER_HOME:-$HOME/.config/desk-meter}"
+SETTINGS="${CLAUDE_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+STATUSLINE="$CONF/statusline.sh"
+DEVICES="$CONF/devices"
+SERVICE="_claude-meter._tcp"
+
+ok()   { printf '  ok    %s\n' "$*"; }
+warn() { printf '  warn  %s\n' "$*"; }
+fail() { printf '  error %s\n' "$*" >&2; }
+
+ensure_conf() {
+  mkdir -p "$CONF"
+  touch "$DEVICES"
+  chmod 600 "$DEVICES"
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || { fail "'$1' is required. $2"; exit 1; }
+}
+
+normalise_host() {
+  local h="${1#http://}"
+  h="${h%%/*}"
+  case "$h" in *.*|*:*) printf '%s' "$h" ;; *) printf '%s.local' "$h" ;; esac
+}
+
+cmd_sync() {
+  ensure_conf
+  cp "$SCRIPT_DIR/statusline.sh" "$STATUSLINE.tmp" && mv "$STATUSLINE.tmp" "$STATUSLINE"
+  chmod 755 "$STATUSLINE"
+}
+
+statusline_command() {
+  [ -f "$SETTINGS" ] || return 0
+  jq -r '.statusLine.command // empty' "$SETTINGS" 2>/dev/null
+}
+
+cmd_install_statusline() {
+  need jq "On macOS: brew install jq"
+  cmd_sync
+  mkdir -p "$(dirname "$SETTINGS")"
+  [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+  if ! jq empty "$SETTINGS" 2>/dev/null; then
+    fail "$SETTINGS isn't plain JSON (comments?), so I won't edit it."
+    echo "  Set statusLine.command to: $STATUSLINE"
+    exit 1
+  fi
+
+  local current
+  current=$(statusline_command)
+  if [ "$current" = "$STATUSLINE" ]; then
+    ok "Status line already uses Desk Meter"
+    return 0
+  fi
+  if [ -n "$current" ]; then
+    printf '%s' "$current" > "$CONF/chain_command"
+    ok "Kept your existing status line; it still shows: $current"
+  fi
+
+  cp "$SETTINGS" "$SETTINGS.desk-meter-backup"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg cmd "$STATUSLINE" \
+     '.statusLine = ((.statusLine // {}) + {type: "command", command: $cmd})' \
+     "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+  ok "Status line now runs Desk Meter (backup: $SETTINGS.desk-meter-backup)"
+}
+
+cmd_remove_statusline() {
+  need jq "On macOS: brew install jq"
+  [ -f "$SETTINGS" ] || { ok "No settings file, nothing to undo"; return 0; }
+  if [ "$(statusline_command)" != "$STATUSLINE" ]; then
+    ok "Status line isn't using Desk Meter, nothing to undo"
+    return 0
+  fi
+  cp "$SETTINGS" "$SETTINGS.desk-meter-backup"
+  local tmp
+  tmp=$(mktemp)
+  if [ -s "$CONF/chain_command" ]; then
+    jq --arg cmd "$(cat "$CONF/chain_command")" '.statusLine.command = $cmd' "$SETTINGS" > "$tmp"
+    ok "Restored your previous status line"
+  else
+    jq 'del(.statusLine)' "$SETTINGS" > "$tmp"
+    ok "Removed the status line setting"
+  fi
+  mv "$tmp" "$SETTINGS"
+  rm -f "$CONF/chain_command"
+}
+
+# curl a meter. For .local names, force IPv4: the meter only answers mDNS
+# A queries, so macOS otherwise stalls ~3s waiting on an AAAA reply that never
+# comes, which eats most of the timeout and makes names look unreachable.
+meter_curl() {
+  local host="$1"; shift
+  case "$host" in
+    *.local|*.local:*) curl -4 "$@" ;;
+    *)                 curl "$@" ;;
+  esac
+}
+
+# Prints the meter's /info JSON, or nothing if unreachable.
+meter_info() {
+  meter_curl "$1" -s -m 4 "http://$1/info" 2>/dev/null
+}
+
+cmd_discover() {
+  need curl ""
+  local names="" tmp
+  tmp=$(mktemp)
+  if command -v dns-sd >/dev/null 2>&1; then          # macOS
+    dns-sd -B "$SERVICE" local. > "$tmp" 2>/dev/null &
+    local pid=$!
+    sleep 3
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    names=$(awk '$2 == "Add" { print $NF }' "$tmp" | sort -u)
+  elif command -v avahi-browse >/dev/null 2>&1; then  # Linux
+    names=$(avahi-browse -tp "$SERVICE" 2>/dev/null | awk -F';' '$1 == "+" { print $4 }' | sort -u)
+  else
+    rm -f "$tmp"
+    fail "No mDNS browser found (dns-sd on macOS, avahi-browse on Linux)."
+    echo "  Add a meter by the name on its MENU > Info page instead."
+    exit 1
+  fi
+  rm -f "$tmp"
+
+  if [ -z "$names" ]; then
+    echo "No meters found. Check the meter is on the same Wi-Fi, or add it by"
+    echo "the address on its MENU > Info page."
+    return 0
+  fi
+  echo "Meters on this network:"
+  local name host info added
+  while IFS= read -r name; do
+    host="$name.local"
+    info=$(meter_info "$host")
+    added=""
+    grep -q "^$host " "$DEVICES" 2>/dev/null && added="  (already added)"
+    if [ -n "$info" ]; then
+      echo "  $host  firmware v$(printf '%s' "$info" | jq -r '.version // "?"' 2>/dev/null)$added"
+    else
+      echo "  $host  (not responding)$added"
+    fi
+  done <<< "$names"
+}
+
+cmd_add() {
+  need curl ""
+  [ $# -ge 2 ] || { fail "Usage: desk-meter add HOST TOKEN"; exit 1; }
+  ensure_conf
+  local host token code
+  host=$(normalise_host "$1")
+  token="$2"
+
+  code=$(meter_curl "$host" -s -m 5 -o /dev/null -w '%{http_code}' -G "http://$host/check" \
+         --data-urlencode "token=$token" 2>/dev/null)
+  case "$code" in
+    200) ok "Token accepted by $host" ;;
+    401) fail "$host rejected that token. Check MENU > Info on the meter."; exit 1 ;;
+    404) warn "$host has older firmware that can't check tokens; adding anyway" ;;
+    *)   fail "Couldn't reach $host. Is it on the same Wi-Fi?"; exit 1 ;;
+  esac
+
+  local tmp
+  tmp=$(mktemp)
+  grep -v "^$host " "$DEVICES" > "$tmp" 2>/dev/null
+  printf '%s %s\n' "$host" "$token" >> "$tmp"
+  mv "$tmp" "$DEVICES"
+  chmod 600 "$DEVICES"
+  rm -f "$CONF/state"  # send fresh data on the next status line update
+  ok "Added $host"
+}
+
+cmd_remove() {
+  [ $# -ge 1 ] || { fail "Usage: desk-meter remove HOST"; exit 1; }
+  ensure_conf
+  local host tmp
+  host=$(normalise_host "$1")
+  if ! grep -q "^$host " "$DEVICES"; then
+    warn "$host isn't in your list"
+    return 0
+  fi
+  tmp=$(mktemp)
+  grep -v "^$host " "$DEVICES" > "$tmp"
+  mv "$tmp" "$DEVICES"
+  chmod 600 "$DEVICES"
+  ok "Removed $host"
+}
+
+cmd_list() {
+  ensure_conf
+  if ! grep -q '[^[:space:]]' "$DEVICES"; then
+    echo "No meters added yet. Run: desk-meter discover, then desk-meter add HOST TOKEN"
+    return 0
+  fi
+  echo "Your meters:"
+  local host token
+  while read -r host token _; do
+    case "$host" in ''|'#'*) continue ;; esac
+    if [ -n "$(meter_info "$host")" ]; then
+      echo "  $host  token ${token:0:3}***  reachable"
+    else
+      echo "  $host  token ${token:0:3}***  NOT reachable"
+    fi
+  done < "$DEVICES"
+}
+
+cmd_test() {
+  need curl ""
+  ensure_conf
+  local now host token code any=""
+  now=$(date +%s)
+  while read -r host token _; do
+    case "$host" in ''|'#'*) continue ;; esac
+    any=1
+    code=$(meter_curl "$host" -s -m 5 -o /dev/null -w '%{http_code}' -G "http://$host/update" \
+      --data-urlencode "token=$token" \
+      --data-urlencode "s=42"  --data-urlencode "sr=$((now + 7200))" \
+      --data-urlencode "w=61"  --data-urlencode "wr=$((now + 3 * 86400))" \
+      --data-urlencode "p=desk-meter test" --data-urlencode "m=Opus" --data-urlencode "e=high" \
+      --data-urlencode "ctx=38" --data-urlencode "cs=200000" --data-urlencode "c=1.23" \
+      --data-urlencode "la=120" --data-urlencode "lr=8" --data-urlencode "d=3900000" 2>/dev/null)
+    case "$code" in
+      200) ok "$host: sample data sent (42% session, 61% week)" ;;
+      401) fail "$host: token rejected" ;;
+      *)   fail "$host: not reachable" ;;
+    esac
+  done < "$DEVICES"
+  [ -n "$any" ] || echo "No meters added yet."
+  rm -f "$CONF/state"  # real data replaces the sample on the next status line update
+}
+
+cmd_doctor() {
+  echo "Desk Meter check:"
+  for tool in jq curl; do
+    if command -v "$tool" >/dev/null 2>&1; then ok "$tool found"
+    else fail "$tool missing (macOS: brew install $tool)"; fi
+  done
+  if command -v dns-sd >/dev/null 2>&1 || command -v avahi-browse >/dev/null 2>&1; then
+    ok "network discovery available"
+  else
+    warn "no mDNS browser, so add meters by name instead of discovering them"
+  fi
+  if [ "$(statusline_command)" = "$STATUSLINE" ]; then ok "status line uses Desk Meter"
+  else warn "status line not set up yet (desk-meter install-statusline)"; fi
+  [ -s "$CONF/chain_command" ] && ok "also showing your previous status line"
+  local count=0
+  [ -f "$DEVICES" ] && count=$(grep -c '^[^#[:space:]]' "$DEVICES")
+  if [ "$count" -gt 0 ]; then ok "$count meter(s) added"
+  else warn "no meters added yet"; fi
+}
+
+case "${1:-}" in
+  doctor)             cmd_doctor ;;
+  sync)               cmd_sync ;;
+  install-statusline) cmd_install_statusline ;;
+  remove-statusline)  cmd_remove_statusline ;;
+  discover)           cmd_discover ;;
+  add)                shift; cmd_add "$@" ;;
+  remove)             shift; cmd_remove "$@" ;;
+  list)               cmd_list ;;
+  test)               cmd_test ;;
+  *)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

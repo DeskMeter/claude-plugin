@@ -1,0 +1,9 @@
+{
+  "name": "desk-meter",
+  "displayName": "Desk Meter",
+  "version": "1.0.0",
+  "description": "Shows your Claude usage limits and current session on an e-ink desk display (Elecrow CrowPanel 2.13\"). Forwards data from the status line to one or more meters on your network.",
+  "author": { "name": "Jacob" },
+  "license": "MIT",
+  "keywords": ["e-ink", "usage", "status line", "esp32", "hardware"]
+}
