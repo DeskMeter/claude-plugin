@@ -6,11 +6,18 @@ You can see how much of your 5-hour session and weekly limit you've used without
 
 ## How it works
 
-Claude Code shares your usage limits only with its status line. So Desk Meter installs a small status line script. Each time the status line updates, the script sends your usage to every meter you've added, over your local network.
+Claude Code shares your usage limits only with its status line. So Desk Meter installs a small status line script that captures your latest usage each time the status line updates and forwards it to every meter you've added, over your local network. While you're idle it resends every few minutes so the meter can tell the data is still current.
 
-- Sending happens in the background, so your status line never waits on the network.
+Some sessions have no status line — most notably the **VS Code extension**. There Desk Meter runs the same script from `Stop` and `PostToolUse` hooks instead, so the meter still updates after each reply. Hooks aren't handed the full usage data the status line gets, so in that mode the script:
+
+- reads the project, model and context use from the session transcript, and
+- asks Anthropic for your session and weekly limits (at most once a minute), using your existing Claude Code login. It falls back to the last numbers the meter was sent if that call can't be made. Create `~/.config/desk-meter/no_usage_fetch` to turn the limit lookup off.
+
+Sessions that *do* have a status line keep using its fuller data, and the hooks step aside for them, so you never get double updates.
+
+- Sending happens in the background, so Claude Code never waits on the network.
 - If you already had a status line, it keeps showing. Desk Meter runs alongside it.
-- Nothing leaves your local network. There is no cloud service or account.
+- Nothing but the usage-limit lookup leaves your local network, and that goes only to Anthropic over your Claude Code login. There is no other cloud service or account.
 
 ## Install
 
@@ -51,9 +58,11 @@ Desk Meter sends these to each meter you've added, over plain HTTP with the mete
 - Session (5-hour) and weekly usage, and when each resets (Pro and Max plans only)
 - Project name, model, effort level, context window usage, session cost, lines changed and session time
 
-It sends only when something has changed, at most once every 10 seconds. It also sends a heartbeat every 5 minutes so the meter can tell the data is still current.
+A status-line session sends all of these. A session with no status line (such as the VS Code extension) sends what it can read without one — project, model and context use, plus the session and weekly limits it looks up from Anthropic.
 
-The connection is unencrypted, so use Desk Meter on a network you trust, such as your home Wi-Fi.
+It sends after each of Claude's replies, at most once every 10 seconds (to protect the e-ink display). It also resends every 5 minutes so the meter can tell the data is still current. An update that arrives inside the 10-second window is held and sent once the window is up, so the last update of a burst isn't lost.
+
+The connection to the meter is unencrypted, so use Desk Meter on a network you trust, such as your home Wi-Fi.
 
 ## Troubleshooting
 
@@ -73,8 +82,12 @@ The connection is unencrypted, so use Desk Meter on a network you trust, such as
 Desk Meter keeps its settings in `~/.config/desk-meter/`:
 
 - `devices`: one `host token` per line, readable only by you
+- `fields`: your latest usage, sent to the meters
 - `chain_command`: your previous status line command, which still shows
-- `statusline.sh`: the script Claude Code runs. It's refreshed from the plugin at the start of each session, so plugin updates take effect.
+- `statusline.sh`: the script Claude Code runs (as a status line, and from hooks). It's refreshed from the plugin at the start of each session, so plugin updates take effect.
+- `no_usage_fetch`: create this (empty) file to stop the usage-limit lookup used by hook mode
+
+It also keeps small bookkeeping files here (`state`, `usage_next`, `sessions/`) for its send timing; you can ignore them.
 
 The only setting it changes in `~/.claude/settings.json` is `statusLine`. It keeps a backup next to that file as `settings.json.desk-meter-backup`.
 
